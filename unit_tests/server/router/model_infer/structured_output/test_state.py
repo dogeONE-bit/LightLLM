@@ -168,11 +168,14 @@ def test_request_admission_loads_shared_artifacts_without_compilation(
     monkeypatch.setattr(
         infer_batch,
         "get_env_start_args",
-        lambda: SimpleNamespace(diverse_mode=False, mtp_step=0, disable_chunked_mm_input=False),
+        lambda: SimpleNamespace(
+            diverse_mode=False, mtp_step=0, disable_chunked_mm_input=False, req_token_index_mode="pin_mem_cache"
+        ),
     )
     context = infer_batch.InferenceContext(
         req_manager=SimpleNamespace(
             alloc=count().__next__,
+            req_to_token_indexs=torch.zeros((len(requests), 1), dtype=torch.int32),
             req_sampling_params_manager=SimpleNamespace(init_req_sampling_params=lambda req: None),
         ),
         shm_req_manager=SimpleNamespace(get_req_obj_by_index=lambda index: shared_reqs[index]),
@@ -247,7 +250,6 @@ def test_constraint_state_lifetime_follows_request_cleanup(compiler):
     grammar = compiler.output_constraint_state_factory.get_grammar(payload)
     context = infer_batch.InferenceContext(
         req_manager=SimpleNamespace(free=lambda *args: None),
-        att_state_manager=SimpleNamespace(full_att_allocator=SimpleNamespace(free=lambda _: None)),
         requests_mapping={1: req},
         shm_req_manager=SimpleNamespace(put_back_req_obj=lambda req: None),
     )
