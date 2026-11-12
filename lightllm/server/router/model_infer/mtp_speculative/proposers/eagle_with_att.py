@@ -33,7 +33,8 @@ class EagleWithAttProposer(BaseSpecProposer):
             b_next_token_ids=target_next_token_ids,
             mtp_draft_input_hiddens=target_model_output.mtp_collector.spec_hidden,
         )
-        self.backend.draft_models[0].forward(draft_input)
+        draft = self.backend.draft_models[0]
+        getattr(draft, "fill_prefill_kv", draft.forward)(draft_input)
 
     def propose_next(
         self,

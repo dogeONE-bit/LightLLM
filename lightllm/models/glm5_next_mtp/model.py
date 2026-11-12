@@ -5,6 +5,7 @@ import torch
 from lightllm.common.basemodel import TpPartBaseModel
 from lightllm.common.basemodel.attention.nsa.glm5_next import Glm5NextSparseAttBackend
 from lightllm.common.basemodel.attention.nsa.fp8_glm5_next import Fp8Glm5NextSparseAttBackend
+from lightllm.common.basemodel.layer_infer.cache_tensor_manager import g_cache_manager
 from lightllm.models.glm5_next.layer_infer.transformer_layer_infer import Glm5NextTransformerLayerInfer
 from lightllm.models.glm5_next.layer_weights.transformer_layer_weight import Glm5NextTransformerLayerWeight
 from lightllm.models.llama.layer_infer.post_layer_infer import LlamaPostLayerInfer
@@ -31,6 +32,48 @@ class Glm5NextMTPModel(TpPartBaseModel):
         self.main_model = kvargs.pop("main_model")
         self.mtp_previous_draft_models = kvargs.pop("mtp_previous_draft_models")
         super().__init__(kvargs)
+
+    def _can_fill_prefill_kv_only(self):
+        args = self.args
+        # This decision must be uniform across EP ranks, including empty ranks.
+        # Keep graph, TP and mixed-mode execution on the normal forward path.
+        return (
+            args.run_mode == "prefill"
+            and args.mtp_mode == "eagle_with_att"
+            and args.mtp_step == 1
+            and args.llm_kv_type == "fp8kv_dsa"
+            and self.tp_world_size_ == 1
+            and not args.enable_tpsp_mix_mode
+            and not args.enable_dp_prefill_balance
+            and not args.enable_prefill_decode_mixed
+            and not args.enable_prefill_microbatch_overlap
+            and self.prefill_graph is None
+            and self.layers_num == len(self.layers_infer) == len(self.trans_layers_weight) == 1
+            and not self.layers_infer[0].is_linear_attention_layer
+            and not self.layers_infer[0].use_mhc
+        )
+
+    @torch.no_grad()
+    def fill_prefill_kv(self, model_input):
+        """Skip unused draft outputs when pure Prefill only needs the cache."""
+        assert model_input.is_prefill
+        if not self._can_fill_prefill_kv_only():
+            return self.forward(model_input)
+
+        model_input.to_cuda()
+        model_input = self._create_padded_prefill_model_input(
+            model_input=model_input, new_handle_token_num=max(1, model_input.input_ids.shape[0])
+        )
+        infer_state = self._create_inferstate(model_input)
+        infer_state.init_some_extra_state(self)
+        infer_state.init_att_state()
+        input_embs = self.pre_infer.context_forward(infer_state.input_ids, infer_state, self.pre_post_weight)
+        infer_state.mtp_draft_input_hiddens = None
+        g_cache_manager.cache_env_in()
+        try:
+            self.layers_infer[0].write_draft_prefill_cache(input_embs, infer_state, self.trans_layers_weight[0])
+        finally:
+            g_cache_manager.cache_env_out()
 
     def _init_config(self):
         # Reuse the validated target configuration without changing its mHC layout.

@@ -73,7 +73,8 @@ def test_eagle_with_att_rejects_zero_draft_steps():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_eagle_with_att_prefill_builds_draft_kv_without_mutating_target():
+@pytest.mark.parametrize("cache_only", [False, True])
+def test_eagle_with_att_prefill_builds_draft_kv_without_mutating_target(cache_only):
     device = "cuda"
     original_input_ids = torch.tensor([10, 11, 12, 20, 21, 22], dtype=torch.int64, device=device)
     target_hidden = torch.arange(12, dtype=torch.float32, device=device).reshape(6, 2)
@@ -101,8 +102,12 @@ def test_eagle_with_att_prefill_builds_draft_kv_without_mutating_target():
         )
         return ModelOutput(logits=torch.empty((0,), device=device))
 
+    draft = SimpleNamespace(forward=forward)
+    if cache_only:
+        draft.fill_prefill_kv = forward
+        draft.forward = lambda _: pytest.fail("cache-only draft must not run full forward")
     proposer = EagleWithAttProposer(
-        backend=SimpleNamespace(draft_models=[SimpleNamespace(forward=forward)]),
+        backend=SimpleNamespace(draft_models=[draft]),
         enable_dynmaic_mtp=False,
     )
     proposer.fill_draft_model_kv_state(

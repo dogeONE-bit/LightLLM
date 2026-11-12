@@ -129,7 +129,7 @@ class Glm5NextTransformerLayerInfer(TransformerLayerInferTpl):
 
         return output.view(num_tokens, hidden_dim)
 
-    def _get_qkv(self, input, infer_state, layer_weight):
+    def _project_sparse_qkv_a(self, input, infer_state, layer_weight):
         if self.is_linear_attention_layer:
             raise AssertionError("KDA projections use _kda_projections")
 
@@ -139,9 +139,9 @@ class Glm5NextTransformerLayerInfer(TransformerLayerInferTpl):
             input = infer_state._all_to_all_unbalance_get(data=input)
 
         q, cache_kv = layer_weight.qkv_a_proj_with_mqa_.mm(input).split([self.q_lora_rank, self.kv_lora_rank], dim=-1)
-        q = rmsnorm_forward(q, weight=layer_weight.q_a_layernorm_.weight, eps=self.eps_)
-        infer_state.get_topk_indices_params = {"hidden_states": input, "q_lora": q}
-        q = layer_weight.q_b_proj_.mm(q).view(-1, self.tp_q_head_num_, self.qk_nope_head_dim)
+        return input, q, cache_kv
+
+    def _normalize_sparse_kv(self, cache_kv, layer_weight):
         cache_kv = cache_kv.view(-1, 1, self.kv_lora_rank)
         rmsnorm_forward(
             cache_kv[:, :, : self.kv_lora_rank],
@@ -149,7 +149,23 @@ class Glm5NextTransformerLayerInfer(TransformerLayerInferTpl):
             eps=self.eps_,
             out=cache_kv[:, :, : self.kv_lora_rank],
         )
-        return q, cache_kv
+        return cache_kv
+
+    def _get_qkv(self, input, infer_state, layer_weight):
+        input, q, cache_kv = self._project_sparse_qkv_a(input, infer_state, layer_weight)
+        q = rmsnorm_forward(q, weight=layer_weight.q_a_layernorm_.weight, eps=self.eps_)
+        infer_state.get_topk_indices_params = {"hidden_states": input, "q_lora": q}
+        q = layer_weight.q_b_proj_.mm(q).view(-1, self.tp_q_head_num_, self.qk_nope_head_dim)
+        return q, self._normalize_sparse_kv(cache_kv, layer_weight)
+
+    def write_draft_prefill_cache(self, input_embeddings, infer_state, layer_weight):
+        """Write the single NextN block's MLA KV, pooled keys and raw tail."""
+        assert infer_state.is_prefill and infer_state.is_draft_model
+        assert not self.use_mhc and self.layer_num_ >= self.num_hidden_layers
+        normed = self._att_norm(input_embeddings, infer_state, layer_weight)
+        hidden, _, kv = self._project_sparse_qkv_a(normed, infer_state, layer_weight)
+        self._post_cache_kv(self._normalize_sparse_kv(kv, layer_weight), infer_state, layer_weight)
+        self.indexer.write_k_pools(hidden, infer_state, infer_state.prefill_att_state, layer_weight)
 
     def _context_attention_kernel(self, q, kv, infer_state, layer_weight, out=None):
         q = layer_weight.k_b_proj_.bmm(q.transpose(0, 1)).transpose(0, 1).contiguous()
